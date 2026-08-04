@@ -1,0 +1,26 @@
+# خيار الـ VPS (اختياري — اللابتوب يكفي للبداية):  docker compose up -d
+# البوت يعمل بالسحب الدوري (polling) فلا حاجة لنطاق ولا HTTPS.
+# يقرأ المتغيرات من ملف .env في نفس المجلد (انسخ .env.example إلى .env واملأه)
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    restart: always
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=${TIMEZONE:-Asia/Gaza}
+      - TZ=${TIMEZONE:-Asia/Gaza}
+      # متغيرات الوورك فلو (تصل للعقد عبر $env)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GOOGLE_SHEET_ID=${GOOGLE_SHEET_ID}
+      - CHAT_ID_OWNER=${CHAT_ID_OWNER}
+      - CHAT_ID_OSAMA=${CHAT_ID_OSAMA}
+      - CHAT_ID_ANAS=${CHAT_ID_ANAS}
+      - TIMEZONE=${TIMEZONE:-Asia/Gaza}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-5}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:

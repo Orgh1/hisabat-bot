@@ -1,0 +1,1732 @@
+{
+  "name": "بوت المحاسبة",
+  "nodes": [
+    {
+      "id": "n001",
+      "name": "سحب الرسائل",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2060,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n002",
+      "name": "طلب التحديثات",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1840,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst st = $getWorkflowStaticData('global');\nconst token = $env.TELEGRAM_BOT_TOKEN;\nif (!token) throw new Error('TELEGRAM_BOT_TOKEN غير معرّف في متغيرات البيئة');\nconst offset = st.tgOffset || 0;\nreturn [{ json: { url: 'https://api.telegram.org/bot' + token + '/getUpdates?timeout=25&offset=' + offset + '&allowed_updates=' + encodeURIComponent('[\"message\",\"callback_query\"]') } }];\n"
+      }
+    },
+    {
+      "id": "n003",
+      "name": "جلب التحديثات",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1620,
+        340
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 35000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "n004",
+      "name": "حجز التحديثات",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1620,
+        180
+      ],
+      "parameters": {
+        "jsCode": "\n// حجز الدفعة: نثبت المؤشر فوراً ونجهز نداء تأكيد الاستلام لتيليجرام —\n// التأكيد يحذف الرسائل من طابور تيليجرام نهائياً فلا يمكن لأي دورة متداخلة سحبها ثانية.\n// وضع الاختبار (Execute من المحرر) لا يؤكد ولا يحرك المؤشر — حتى لا تُبلع رسائل حقيقية أثناء التجارب.\nconst st = $getWorkflowStaticData('global');\nconst resp = $input.first().json;\nconst updates = (resp && resp.result) || [];\nif (!updates.length) return [];\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst isTest = $execution.mode !== 'production';\nconst nextOffset = updates[updates.length - 1].update_id + 1;\nif (!isTest) st.tgOffset = nextOffset;\nconst confirmUrl = isTest\n  ? 'https://api.telegram.org/bot' + token + '/getMe'\n  : 'https://api.telegram.org/bot' + token + '/getUpdates?offset=' + nextOffset + '&limit=1&timeout=0';\nreturn [{ json: { updates, confirmUrl } }];\n"
+      }
+    },
+    {
+      "id": "n005",
+      "name": "تأكيد الاستلام",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1500,
+        180
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.confirmUrl }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "n006",
+      "name": "توزيع التحديثات",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1400,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// يقرأ من مدخله المباشر (مخرج «حجز التحديثات») — لا قراءة بالاسم إطلاقاً\nconst reserved = $input.first().json;\nreturn (reserved.updates || []).map((u) => ({ json: u }));\n"
+      }
+    },
+    {
+      "id": "n007",
+      "name": "فرز وتحقق",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1180,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst st = $getWorkflowStaticData('global');\nst.seen = st.seen || [];\nconst out = [];\nfor (const item of $input.all()) {\n  const upd = item.json;\n  const msg = upd.message;\n  const cb = upd.callback_query;\n  const chatId = String(msg ? msg.chat.id : cb ? cb.message.chat.id : '');\n  const who = CHAT_IDS[chatId];\n  if (!who) continue; // غير مصرّح: تجاهل بصمت\n  const updateId = String(upd.update_id);\n  if (st.seen.includes(updateId)) continue; // منع تكرار\n  st.seen.push(updateId);\n  const base = { chatId, sender: who.name, senderExpenses: who.expenses, updateId };\n  if (cb) {\n    out.push({ json: { ...base, kind: 'callback', callbackId: cb.id, data: cb.data || '' } });\n    continue;\n  }\n  if (!msg || msg.voice || msg.audio) {\n    out.push({ json: { ...base, kind: 'command', text: '/صوت' } });\n    continue;\n  }\n  let text = (msg.text || '').trim();\n  if (!text) continue;\n  const BARE = { 'رصيد': '/رصيد', 'مخزون': '/مخزون', 'مساعدة': '/مساعدة' }; // أزرار اللوحة الدائمة\n  if (BARE[text]) text = BARE[text];\n  out.push({ json: { ...base, kind: text.startsWith('/') ? 'command' : 'text', msgId: updateId, date: todayStr(msg.date), replyTo: msg.message_id, text } });\n}\nif (st.seen.length > 500) st.seen = st.seen.slice(-300);\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n008",
+      "name": "زر؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.kind }}",
+              "value2": "callback"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n009",
+      "name": "أمر؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -740,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.kind }}",
+              "value2": "command"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n010",
+      "name": "قراءة الإعدادات",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -520,
+        560
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEET_ID + '/values:batchGet?valueRenderOption=UNFORMATTED_VALUE' + '&ranges=' + encodeURIComponent(\"'الإعدادات'!A1:G110\") + '&ranges=' + encodeURIComponent(\"'أرصدة المواقع'!A5:P12\") }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n011",
+      "name": "المحلل",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -300,
+        560
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\n'use strict';\n/**\n * الطبقة الأولى — محلّل الصيغة المختصرة (حتمي، بلا نموذج لغوي).\n * يعمل محلياً في الاختبارات وداخل عقدة Code في n8n بلا تعديل.\n *\n * parseMessage(text, config) → { lines: [ {matched, op?, fallback?} ] }\n *   matched=true  + op          : عملية جاهزة (قد تكون يحتاج_توضيح=true بسؤال محدد)\n *   matched=false + fallback    : السطر لا يطابق الصيغة — يُرسل للنموذج اللغوي\n */\n\nconst AR_DIGITS = { '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4', '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9' };\nconst FILLERS = new Set(['من', 'الي', 'إلى', 'على', 'عن', 'ل', 'لـ', 'في']);\n\nfunction stripInvisible(s) {\n  // علامات الاتجاه والمحارف الخفية التي تحشرها لوحات مفاتيح الهواتف (RLM/LRM/ZWJ/BOM/NBSP...)\n  return String(s).replace(/[ ​-‏‪-‮⁠-⁩﻿]/g, ' ');\n}\n\nfunction normalize(s) {\n  return stripInvisible(s)\n    .replace(/[٠-٩]/g, (d) => AR_DIGITS[d])\n    .replace(/[ً-ْٰـ]/g, '') // تشكيل وتطويل\n    .replace(/[أإآ]/g, 'ا')\n    .replace(/ى/g, 'ي')\n    .replace(/ة/g, 'ه')\n    .trim();\n}\n\nfunction isNumber(tok) {\n  return /^-?\\d+(\\.\\d+)?$/.test(tok);\n}\n\nfunction baseOp(text) {\n  return {\n    'نوع_العملية': null,\n    'التاريخ': null, // يحقنه الـ workflow (تاريخ اليوم بتوقيت TIMEZONE)\n    'المبلغ': null,\n    'العملة': 'شيكل',\n    'الحساب': null,\n    'الحساب_المقابل': null,\n    'المنفّذ': 'أنا',\n    'الاتجاه': null,\n    'الموقع': null,\n    'نوع_التجديد': null,\n    'اسم_العميل': null,\n    'معرف_الاشتراك': null,\n    'البند': null,\n    'التصنيف': null,\n    'نص_الملاحظة': null,\n    'الثقة': 1,\n    'يحتاج_توضيح': false,\n    'سؤال_التوضيح': null,\n    'النص_الأصلي': text,\n  };\n}\n\nfunction ask(op, question) {\n  op['يحتاج_توضيح'] = true;\n  op['سؤال_التوضيح'] = question;\n  return { matched: true, op };\n}\n\n/** يبني قواميس بحث مطبَّعة من الإعدادات */\nfunction buildLookups(config) {\n  const acc = {};\n  for (const [k, v] of Object.entries(config.accounts)) acc[normalize(k)] = v;\n  const dests = {};\n  for (const [k, v] of Object.entries(config.dests)) dests[normalize(k)] = v;\n  const chips = {};\n  for (const [k, v] of Object.entries(config.chips)) chips[normalize(k)] = v;\n  const sites = {};\n  for (const s of config.sites) sites[normalize(s)] = s;\n  return { acc, dests, chips, sites };\n}\n\nfunction accountCurrency(config, account) {\n  return (config.accountCurrencies && config.accountCurrencies[account]) || 'شيكل';\n}\n\nfunction shortcutHelp(config) {\n  return `الحساب غير معروف. الاختصارات المتاحة: ${Object.keys(config.accounts).join(' · ')}`;\n}\n\n/** يلتقط المدة من المصفوفة ويعيد [المدة أو null, مؤشرات التوكنات المستهلكة]\n *  الصيغ: شهر · 3 شهور · ش (=شهر) · 3ش أو 3 ش (=3 شهور) */\nfunction extractDuration(toks) {\n  for (let i = 0; i < toks.length; i++) {\n    if (toks[i] === 'شهر') return ['شهر', [i]];\n    if ((toks[i] === 'شهور' || toks[i] === 'ش') && i > 0 && isNumber(toks[i - 1])) {\n      return [toks[i - 1] === '1' ? 'شهر' : `${toks[i - 1]} شهور`, [i - 1, i]];\n    }\n    if (toks[i] === 'ش') return ['شهر', [i]];\n    const m = toks[i].match(/^(\\d+)ش$/);\n    if (m) return [m[1] === '1' ? 'شهر' : `${m[1]} شهور`, [i]];\n  }\n  return [null, []];\n}\n\n/** يلتقط الشريحة (مع التهام «موبايل» بعد «هوت») */\nfunction extractChip(toks, chips) {\n  for (let i = 0; i < toks.length; i++) {\n    if (chips[toks[i]]) {\n      const used = [i];\n      if (toks[i] === 'هوت' && toks[i + 1] === 'موبايل') used.push(i + 1);\n      return [chips[toks[i]], used];\n    }\n  }\n  return [null, []];\n}\n\nfunction extractSite(toks, sites) {\n  for (let i = 0; i < toks.length; i++) if (sites[toks[i]]) return [sites[toks[i]], [i]];\n  return [null, []];\n}\n\nfunction leftoverText(rawToks, usedIdx) {\n  const used = new Set(usedIdx);\n  const rest = rawToks.filter((_, i) => !used.has(i));\n  return rest.length ? rest.join(' ') : null;\n}\n\nfunction parseLine(rawLine, config, lk) {\n  const text = rawLine.trim();\n  const rawToks = text.split(/\\s+/);\n  const toks = rawToks.map(normalize);\n  const head = toks[0];\n\n  // ملاحظة <نص حر — يُحفظ حرفياً من النص الأصلي>\n  if (head === 'ملاحظه' || (head === 'ضيف' && toks[1] === 'ملاحظه')) {\n    const skip = head === 'ضيف' ? 2 : 1;\n    const note = rawToks.slice(skip).join(' ');\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'ملاحظة';\n    if (!note) return ask(op, 'ما نص الملاحظة؟');\n    op['نص_الملاحظة'] = note;\n    return { matched: true, op };\n  }\n\n  // مطابقة <موقع> <الرصيد الفعلي ±>\n  if (head === 'مطابقه') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'تسوية_مطابقة';\n    const site = lk.sites[toks[1]];\n    const num = toks.slice(2).find(isNumber);\n    if (!site) return ask(op, `أي موقع؟ المواقع: ${config.sites.join(' · ')}`);\n    if (num === undefined) return ask(op, 'ما الرصيد الفعلي الظاهر على الموقع؟ (قد يكون سالباً لليان)');\n    op['الموقع'] = site;\n    op['المبلغ'] = parseFloat(num);\n    op._derived = { confirmRequired: true }; // تثبيت التسوية وحده خلف تأكيد\n    return { matched: true, op };\n  }\n\n  // سدد <مبلغ> <حساب> — تسديد من أبو حسام\n  if (head === 'سدد') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'تسديد';\n    op['الاتجاه'] = 'وارد';\n    op['المنفّذ'] = config.executorName || 'أبو حسام';\n    const rest = toks.slice(1).filter((t) => !FILLERS.has(t));\n    const num = rest.find(isNumber);\n    const accTok = rest.find((t) => lk.acc[t]);\n    if (num === undefined) return ask(op, 'كم المبلغ المسدَّد؟');\n    if (!accTok) return ask(op, `على أي حساب استلمت التسديد؟ ${shortcutHelp(config)}`);\n    op['المبلغ'] = parseFloat(num);\n    op['الحساب'] = lk.acc[accTok];\n    op['التصنيف'] = 'تسديد من منفّذ';\n    return { matched: true, op };\n  }\n\n  // شحن <موقع> <مبلغ> <حساب>\n  if (head === 'شحن') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'شحن_رصيد';\n    op['الاتجاه'] = 'صادر';\n    const rest = toks.slice(1).filter((t) => !FILLERS.has(t));\n    const siteTok = rest.find((t) => lk.sites[t]);\n    const num = rest.find(isNumber);\n    const accTok = rest.find((t) => lk.acc[t]);\n    if (!siteTok) return ask(op, `أي موقع تشحن؟ المواقع: ${config.sites.join(' · ')}`);\n    if (num === undefined) return ask(op, 'كم مبلغ الشحن؟');\n    if (!accTok) return ask(op, `من أي حساب دفعت؟ ${shortcutHelp(config)}`);\n    op['الموقع'] = lk.sites[siteTok];\n    op['المبلغ'] = parseFloat(num);\n    op['الحساب'] = lk.acc[accTok];\n    op['التصنيف'] = 'شحن رصيد موقع';\n    return { matched: true, op };\n  }\n\n  // حول <حساب1> <حساب2> <مبلغ> — تحويل داخلي بالشيكل\n  if (head === 'حول') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'تحويل_داخلي';\n    const rest = toks.slice(1).filter((t) => !FILLERS.has(t));\n    const accToks = rest.filter((t) => lk.acc[t]);\n    const num = rest.find(isNumber);\n    if (accToks.length !== 2) return ask(op, `التحويل يحتاج حسابين. ${shortcutHelp(config)}`);\n    if (num === undefined) return ask(op, 'كم المبلغ المحوَّل؟');\n    const from = lk.acc[accToks[0]];\n    const to = lk.acc[accToks[1]];\n    if (accountCurrency(config, from) !== accountCurrency(config, to)) {\n      return ask(op, 'التحويل من/إلى بايننس يغيّر العملة — استعمل: «شراء بايننس <كمية> <حساب الدفع>»');\n    }\n    op['الحساب'] = from;\n    op['الحساب_المقابل'] = to;\n    op['المبلغ'] = parseFloat(num);\n    op['الاتجاه'] = 'صادر';\n    op['التصنيف'] = 'تحويل بين الحسابات';\n    return { matched: true, op };\n  }\n\n  // شراء بايننس <كمية USDT> <حساب الدفع>\n  if (head === 'شراء') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'شراء_USDT';\n    op['العملة'] = 'USDT';\n    const rest = toks.slice(1).filter((t) => !FILLERS.has(t) && t !== 'بايننس' && t !== 'usdt');\n    const num = rest.find(isNumber);\n    const accTok = rest.find((t) => lk.acc[t] && lk.acc[t] !== config.binanceAccount);\n    if (num === undefined) return ask(op, 'كم كمية الـ USDT المشتراة؟');\n    if (!accTok) return ask(op, `من أي حساب دفعت الشيكل؟ ${shortcutHelp(config)}`);\n    op['المبلغ'] = parseFloat(num);\n    op['الحساب'] = config.binanceAccount;\n    op['الحساب_المقابل'] = lk.acc[accTok];\n    op['الاتجاه'] = 'وارد';\n    op['التصنيف'] = 'تحويل بين الحسابات';\n    op._derived = { rate: config.fxRate, shekel: parseFloat(num) * config.fxRate };\n    return { matched: true, op };\n  }\n\n  // <شريحة> <مدة> [موقع] <بيت|اسامة|انس> — تجديد عائلي: التكلفة مصروف على صاحبه وخصم من الموقع، بلا نقد\n  if (lk.chips[head]) {\n    const op = baseOp(text);\n    const [chip] = extractChip(toks, lk.chips);\n    const [dur] = extractDuration(toks);\n    const [siteName] = extractSite(toks, lk.sites);\n    const destIdx = toks.findIndex((t) => lk.dests[t]);\n    if (destIdx === -1) {\n      return ask(op, 'تجديد لمن؟ أضف الوجهة: بيت أو اسامة أو انس — مثال: وي 1ش الوها انس\\n(لو هذا بيع لزبون استعمل: وارد بال 60 ' + rawToks.join(' ') + ')');\n    }\n    if (!dur) return ask(op, 'ما المدة؟ مثال: وي 1ش الوها انس');\n    const saleSite = siteName || config.defaultSite;\n    const key = `${chip} - ${dur} - ${saleSite}`;\n    let cost = config.pricing[key];\n    if ((cost === undefined || cost === null) && saleSite !== config.defaultSite) {\n      cost = config.pricing[`${chip} - ${dur} - ${config.defaultSite}`];\n    }\n    if (cost === undefined || cost === null) {\n      return ask(op, `تكلفة «${chip} - ${dur}» غير مُدخلة في جدول التسعير — أدخلها أولاً.`);\n    }\n    const destSheet = lk.dests[toks[destIdx]];\n    op['نوع_العملية'] = 'تجديد_عائلي';\n    op['نوع_التجديد'] = key;\n    op['الموقع'] = saleSite;\n    op['اسم_العميل'] = destSheet.replace('مصاريف ', '');\n    op._derived = { cost, chip, dur, expenseType: config.destTypes[destSheet] };\n    return { matched: true, op };\n  }\n\n  // شريحة <نوع> <مدة> <مبلغ> [حساب] [اسم] — صيغة طبيعية للبيع؛ تُعاد كتابتها كصيغة «وارد»\n  if (head === 'شريحه' || head === 'بعت') {\n    const restRaw = rawToks.slice(1);\n    const restNorm = toks.slice(1);\n    const op = baseOp(text);\n    const amtIdx = restNorm.findIndex((t, i) => isNumber(t) && restNorm[i + 1] !== 'شهور' && restNorm[i + 1] !== 'ش');\n    if (amtIdx === -1) return ask(op, 'كم المبلغ الوارد؟ مثال: شريحة وي 3 شهور 150 بال');\n    const accIdx = restNorm.findIndex((t) => lk.acc[t]);\n    const [chip, chipUsed] = extractChip(restNorm, lk.chips);\n    if (accIdx === -1 || !chip) {\n      // سؤال واحد يجمع كل الناقص + سطر جاهز للنسخ والتعديل\n      const [dur, durUsed] = extractDuration(restNorm);\n      const [siteName, siteUsed] = extractSite(restNorm, lk.sites);\n      const used = new Set([amtIdx, accIdx, ...chipUsed, ...durUsed, ...siteUsed].filter((i) => i >= 0));\n      const client = restRaw.filter((_, i) => !used.has(i)).join(' ');\n      const parts = ['وارد',\n        accIdx === -1 ? '<الحساب>' : restRaw[accIdx],\n        restNorm[amtIdx],\n        chip ? chipUsed.map((i) => restRaw[i]).join(' ') : '<الشريحة>',\n        dur || '<المدة>'];\n      if (siteName) parts.push(siteName);\n      if (client) parts.push(client);\n      const miss = [];\n      if (accIdx === -1) miss.push('الحساب المستلم (فلسطين/اسلامي/بال/جوال/كاش/اجل)');\n      if (!chip) miss.push('نوع الشريحة (وي/سيليكوم/هوت/بارتنر/بيليفون)');\n      return ask(op, 'ناقص: ' + miss.join(' و') + '.\\nانسخ السطر وعدّل ما بين <> ثم أرسل:\\n' + parts.join(' '));\n    }\n    const rebuilt = ['وارد', restRaw[accIdx], restNorm[amtIdx], ...restRaw.filter((_, i) => i !== amtIdx && i !== accIdx)].join(' ');\n    const res = parseLine(rebuilt, config, lk);\n    if (res.op) res.op['النص_الأصلي'] = text;\n    return res;\n  }\n\n  // كشف <حساب> [مدة: اسبوع | شهر | شهرين | عدد أيام | N شهور] — عرض حركات الحساب\n  if (head === 'كشف') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'كشف_حساب';\n    const rest = toks.slice(1);\n    const accTok = rest.find((t) => lk.acc[t]);\n    if (!accTok) return ask(op, 'كشف أي حساب؟ أمثلة: كشف فلسطين شهر · كشف هيئة اسبوع · كشف جوالي 60');\n    let days = 30;\n    rest.forEach((t, i) => {\n      if (t === 'اسبوع') days = 7;\n      else if (t === 'شهر') days = 30;\n      else if (t === 'شهرين') days = 60;\n      else if (isNumber(t) && parseFloat(t) > 0 && parseFloat(t) <= 365) {\n        days = rest[i + 1] === 'شهور' ? parseFloat(t) * 30 : parseFloat(t);\n      }\n    });\n    op['الحساب'] = lk.acc[accTok];\n    op._derived = { days };\n    return { matched: true, op };\n  }\n\n  // هيئة <حساب الدفع> <رقم الجوال> <المبلغ> <طالب الخدمة> <نوع الخدمة...> — الترتيب حر\n  if (head === 'هيئه') {\n    const op = baseOp(text);\n    op['نوع_العملية'] = 'خدمة_هيئة';\n    const restRaw = rawToks.slice(1);\n    const restNorm = toks.slice(1);\n    const used = new Set();\n    let phone = null; let accIdx = -1;\n    restNorm.forEach((t, i) => {\n      if (!phone && /^05\\d{8}$/.test(t)) { phone = t; used.add(i); return; }\n      if (accIdx === -1 && lk.acc[t]) { accIdx = i; used.add(i); }\n    });\n    let amt = null;\n    restNorm.forEach((t, i) => { if (amt === null && !used.has(i) && isNumber(t)) { amt = parseFloat(t); used.add(i); } });\n    let seeker = null;\n    restNorm.forEach((t, i) => { if (seeker === null && !used.has(i) && !isNumber(t)) { seeker = restRaw[i]; used.add(i); } });\n    const service = restRaw.filter((_, i) => !used.has(i)).join(' ') || null;\n    if (amt === null) {\n      return ask(op, 'ناقص المبلغ.\\nالصيغة: هيئة 0590000000 64 خالد فاتورة شهر 7 (الدفع من رصيد جوال تلقائياً، أو اذكر الحساب)');\n    }\n    // بلا حساب مذكور: الدفع من «رصيد جوال» تلقائياً\n    op['الحساب'] = accIdx === -1 ? (config.defaultServiceAccount || 'رصيد جوال') : lk.acc[restNorm[accIdx]];\n    op['المبلغ'] = amt;\n    op['معرف_الاشتراك'] = phone;\n    op['اسم_العميل'] = seeker;\n    op['البند'] = service;\n    op['الاتجاه'] = 'صادر';\n    return { matched: true, op };\n  }\n\n  // وارد | صادر <حساب> <مبلغ> <البقية حرة>\n  if (head === 'وارد' || head === 'صادر') {\n    const op = baseOp(text);\n    op['الاتجاه'] = head === 'وارد' ? 'وارد' : 'صادر';\n    const accTok = toks[1];\n    if (!accTok || !lk.acc[accTok]) {\n      return ask(op, shortcutHelp(config));\n    }\n    op['الحساب'] = lk.acc[accTok];\n    op['العملة'] = accountCurrency(config, op['الحساب']);\n    if (!toks[2] || !isNumber(toks[2])) return ask(op, 'كم المبلغ؟ الصيغة: وارد/صادر <الحساب> <المبلغ> …');\n    op['المبلغ'] = parseFloat(toks[2]);\n    if (op['المبلغ'] <= 0) return ask(op, 'المبلغ يجب أن يكون أكبر من صفر.');\n\n    const restIdx = [];\n    for (let i = 3; i < toks.length; i++) restIdx.push(i);\n    const rest = restIdx.map((i) => toks[i]);\n\n    // ترحيل في أي موضع ← صفحة الترحيل والنص محفوظ حرفياً\n    if (rest.includes('ترحيل')) {\n      op['نوع_العملية'] = 'حركة_عامة';\n      op['التصنيف'] = 'ترحيل';\n      op['البند'] = leftoverText(rawToks, [0, 1, 2]);\n      op._derived = { route: 'حركات للترحيل' };\n      return { matched: true, op };\n    }\n\n    // وجهة مصروف: بيت / اسامة / انس\n    const destIdx = restIdx.find((i) => lk.dests[toks[i]]);\n    if (destIdx !== undefined) {\n      if (op['الاتجاه'] !== 'صادر') return ask(op, 'مصروف باتجاه وارد؟ وضّح العملية.');\n      op['نوع_العملية'] = config.destTypes[lk.dests[toks[destIdx]]];\n      op['البند'] = leftoverText(rawToks, [0, 1, 2, destIdx]);\n      return { matched: true, op };\n    }\n\n    // بيع شريحة بلاستيك من المخزون\n    const plasticIdx = restIdx.find((i) => toks[i] === 'بلاستيك');\n    if (plasticIdx !== undefined) {\n      const [chip, chipUsed] = extractChip(rest, lk.chips);\n      if (!chip) return ask(op, `أي نوع بلاستيك؟ الأنواع: ${Object.values(config.chips).join(' · ')}`);\n      const key = `${chip} - بلاستيك - مخزون`;\n      const cost = config.pricing[key];\n      if (cost === undefined || cost === null) {\n        return ask(op, `تكلفة «${key}» غير مُدخلة في جدول التسعير — أدخلها أولاً.`);\n      }\n      op['نوع_العملية'] = 'بيع_بلاستيك';\n      op['نوع_التجديد'] = key;\n      const usedIdx = [0, 1, 2, plasticIdx, ...chipUsed.map((j) => restIdx[j])];\n      op['اسم_العميل'] = leftoverText(rawToks, usedIdx);\n      op._derived = { cost, profit: op['المبلغ'] - cost, chip, stock: { chip, delta: -1 } };\n      return { matched: true, op };\n    }\n\n    // بيع / تجديد: شريحة + مدة (+ موقع اختياري، الافتراضي ليان)\n    const [chip, chipUsed] = extractChip(rest, lk.chips);\n    const [dur, durUsed] = extractDuration(rest);\n    const [site, siteUsed] = extractSite(rest, lk.sites);\n    if (chip || dur || site) {\n      if (!chip) return ask(op, `أي شريحة؟ الشرائح: ${Object.values(config.chips).join(' · ')}`);\n      if (!dur) return ask(op, 'ما المدة؟ شهر أم 3 شهور؟');\n      const saleSite = site || config.defaultSite;\n      const key = `${chip} - ${dur} - ${saleSite}`;\n      let cost = config.pricing[key];\n      if ((cost === undefined || cost === null) && saleSite !== config.defaultSite) {\n        // التكلفة موحّدة بين المواقع: صف الموقع يغلب إن وُجد، وإلا تكلفة الموقع الافتراضي\n        cost = config.pricing[`${chip} - ${dur} - ${config.defaultSite}`];\n      }\n      if (cost === undefined || cost === null) {\n        return ask(op, `تكلفة «${chip} - ${dur}» غير مُدخلة في جدول التسعير — أدخلها أولاً ثم أعد الإرسال.`);\n      }\n      op['نوع_العملية'] = 'بيع';\n      op['نوع_التجديد'] = key;\n      op['الموقع'] = saleSite;\n      const usedIdx = [0, 1, 2, ...[...chipUsed, ...durUsed, ...siteUsed].map((j) => restIdx[j])];\n      op['اسم_العميل'] = leftoverText(rawToks, usedIdx);\n      op._derived = { cost, profit: op['المبلغ'] - cost, chip };\n      return { matched: true, op };\n    }\n\n    // لا شريحة ولا وجهة: حركة عامة على الحساب\n    op['نوع_العملية'] = 'حركة_عامة';\n    op['البند'] = leftoverText(rawToks, [0, 1, 2]);\n    if (op['العملة'] === 'USDT') op._derived = { rate: config.fxRate, shekel: op['المبلغ'] * config.fxRate };\n    return { matched: true, op };\n  }\n\n  // لا يطابق الصيغة المختصرة ← الطبقة الثانية (النموذج اللغوي)\n  return { matched: false, fallback: text };\n}\n\nfunction parseMessage(text, config) {\n  const lk = buildLookups(config);\n  const lines = stripInvisible(String(text))\n    .split(/\\r?\\n/)\n    .map((l) => l.replace(/\\s+/g, ' ').trim())\n    .filter(Boolean);\n  return { lines: lines.map((l) => parseLine(l, config, lk)) };\n}\n\n\n\nconst textItems = $('فرز وتحقق').all().filter((x) => x.json.kind === 'text');\nconst allOut = [];\n$input.all().forEach((respItem, respIdx) => {\nconst ranges = respItem.json.valueRanges || [];\nconst settings = (ranges[0] && ranges[0].values) || [];\nconst sites = (ranges[1] && ranges[1].values) || [];\nconst ctx = textItems[respIdx].json;\n\n// بناء الإعدادات من صفحة «الإعدادات» A1:G110\nfunction cell(r, c) { return (settings[r - 1] || [])[c] !== undefined ? settings[r - 1][c] : ''; }\nconst config = {\n  accounts: {}, accountCurrencies: {}, binanceAccount: 'محفظة بايننس',\n  dests: { 'بيت': 'مصاريف البيت', 'اسامة': 'مصاريف أسامة', 'انس': 'مصاريف أنس' },\n  destTypes: { 'مصاريف البيت': 'مصروف_بيت', 'مصاريف أسامة': 'مصروف_اسامة', 'مصاريف أنس': 'مصروف_انس' },\n  chips: { 'ويكوم': 'ويكوم', 'وي': 'ويكوم', 'سيليكوم': 'سيليكوم', 'هوت': 'هوت موبايل', 'بارتنر': 'بارتنر', 'بيليفون': 'بيليفون' },\n  sites: [], defaultSite: 'ليان', executorName: 'أبو حسام',\n  fxRate: parseFloat(cell(49, 2)) || 3, pricing: {},\n};\nfor (let r = 5; r <= 34; r++) { const k = cell(r, 5); if (k) config.pricing[k] = cell(r, 4) === '' ? null : parseFloat(cell(r, 4)); }\nfor (let r = 37; r <= 46; r++) { const nameAcc = cell(r, 1); if (nameAcc) { config.accountCurrencies[nameAcc] = cell(r, 3) || 'شيكل'; } }\n// الاختصارات الأساسية مدمجة دائماً؛ صفوف الشيت (النوع=حساب) تضيف أو تغلب\nconfig.accounts = { 'فلسطين': 'بنك فلسطين', 'بنك': 'بنك فلسطين', 'البنك': 'بنك فلسطين', 'اسلامي': 'البنك الإسلامي الفلسطيني', 'بال': 'محفظة بال باي', 'جوال': 'محفظة جوال باي', 'بايننس': 'محفظة بايننس', 'كاش': 'كاش', 'اجل': 'آجل', 'هيئة': 'هيئة المستقبل', 'جوالي': 'رصيد جوال' };\nconfig.defaultServiceAccount = 'رصيد جوال';\nfor (let r = 64; r <= 87; r++) { const sc = cell(r, 1); if (sc && cell(r, 3) === 'حساب') config.accounts[sc] = cell(r, 2); }\nconst siteBalances = {};\nfor (const row of sites) { if (row && row[1]) { config.sites.push(String(row[1])); siteBalances[String(row[1])] = parseFloat(row[6]) || 0; } }\nif (!config.sites.length) config.sites = ['ليان', 'الوها', 'سكاي', 'ارين'];\nconst inventory = {};\nfor (let r = 106; r <= 110; r++) { if (cell(r, 0)) inventory[cell(r, 0)] = parseFloat(cell(r, 5)) || 0; }\n\n// جواب سؤال معلّق: لا يُدمج في التحليل القاعدي (حتى لا تتضاعف العمليات) —\n// يُرفق فقط كسياق للنموذج اللغوي عند السطر غير المفهوم، ولمرة واحدة\nconst st = $getWorkflowStaticData('global');\nst.clarify = st.clarify || {};\nlet pend = st.clarify[ctx.chatId];\nif (pend && (pend.v !== 2 || Date.now() - pend.ts > 30 * 60 * 1000)) { delete st.clarify[ctx.chatId]; pend = null; }\nif (pend) delete st.clarify[ctx.chatId];\n\n// —— معالج البيع بالأزرار ——\nst.wizard = st.wizard || {};\nlet wiz = st.wizard[ctx.chatId];\nif (wiz && Date.now() - wiz.ts > 60 * 60 * 1000) { delete st.wizard[ctx.chatId]; wiz = null; } // ساعة — تحمّلاً للانقطاعات\nlet effText = ctx.text;\nconst bareWord = normalize(ctx.text);\n// (مدخل معالج الأزرار معطَّل بقرار المستخدم — القوالب المثبتة أنسب لواقع الانقطاع)\nif (wiz && (bareWord === 'الغاء' || bareWord === 'إلغاء')) {\n  delete st.wizard[ctx.chatId];\n  allOut.push({ json: { wiz: true, chatId: ctx.chatId, text: '👍 أُلغي المعالج.', kb: null } });\n  return;\n}\nif (wiz && wiz.step === 'amt') {\n  const mtoks = normalize(ctx.text).split(/s+/);\n  const amtTok = mtoks.find((t) => isNumber(t) && parseFloat(t) > 0);\n  if (!amtTok) {\n    allOut.push({ json: { wiz: true, chatId: ctx.chatId, text: 'أرسل رقم المبلغ (مع الاسم اختياراً)\\nمثال: 150 فهد حلس', kb: null } });\n    return;\n  }\n  delete st.wizard[ctx.chatId];\n  const client = ctx.text.split(/s+/).filter((t) => normalize(t) !== amtTok).join(' ');\n  effText = ['وارد', wiz.d.acc, amtTok]\n    .concat(wiz.d.dur === 'بلاستيك' ? ['بلاستيك', wiz.d.chip] : [wiz.d.chip, wiz.d.dur])\n    .concat(wiz.d.site && wiz.d.site !== 'ليان' ? [wiz.d.site] : [])\n    .concat(client ? [client] : [])\n    .join(' ');\n}\n\nconst parsed = parseMessage(effText, config);\nconst pricingTable = Object.entries(config.pricing).map(([k, v]) => k + ' ← ' + (v === null ? 'غير مدخلة' : v)).join('\\n');\nconst schema = {\n  type: 'object', additionalProperties: false,\n  required: ['نوع_العملية','المبلغ','العملة','الحساب','الحساب_المقابل','المنفّذ','الاتجاه','الموقع','نوع_التجديد','اسم_العميل','معرف_الاشتراك','البند','التصنيف','نص_الملاحظة','الثقة','يحتاج_توضيح','سؤال_التوضيح'],\n  properties: {\n    'نوع_العملية': { type: 'string', enum: ['بيع','بيع_بلاستيك','مصروف_بيت','مصروف_اسامة','مصروف_انس','شحن_رصيد','تحويل_داخلي','شراء_USDT','بيع_USDT','تسوية_مطابقة','تسديد','ملاحظة','حركة_عامة'] },\n    'المبلغ': { type: ['number','null'] }, 'العملة': { type: 'string', enum: ['شيكل','USDT'] },\n    'الحساب': { type: ['string','null'] }, 'الحساب_المقابل': { type: ['string','null'] },\n    'المنفّذ': { type: 'string' }, 'الاتجاه': { type: ['string','null'], enum: ['وارد','صادر',null] },\n    'الموقع': { type: ['string','null'] }, 'نوع_التجديد': { type: ['string','null'] },\n    'اسم_العميل': { type: ['string','null'] }, 'معرف_الاشتراك': { type: ['string','null'] },\n    'البند': { type: ['string','null'] }, 'التصنيف': { type: ['string','null'] }, 'نص_الملاحظة': { type: ['string','null'] },\n    'الثقة': { type: 'number' }, 'يحتاج_توضيح': { type: 'boolean' }, 'سؤال_التوضيح': { type: ['string','null'] },\n  },\n};\nconst out = [];\nparsed.lines.forEach((line, i) => {\n  const base = { ...ctx, opIndex: i, opCount: parsed.lines.length, config: { fxRate: config.fxRate, pricing: config.pricing, accountCurrencies: config.accountCurrencies, defaultSite: config.defaultSite }, siteBalances, inventory, needsLLM: false };\n  if (line.matched) { out.push({ json: { ...base, op: line.op } }); return; }\n  const fbText = pend ? pend.text + ' — توضيح المستخدم: ' + line.fallback : line.fallback;\n  if (pend) pend = null; // يُستهلك مرة واحدة\n  if (!$env.ANTHROPIC_API_KEY) {\n    // بلا مفتاح Anthropic: الطبقة الثانية معطلة — نرشد للصيغة المختصرة بدل الفشل\n    out.push({ json: { ...base, op: { 'يحتاج_توضيح': true,\n      'سؤال_التوضيح': 'لم أفهم الرسالة. استعمل الصيغة المختصرة — أرسل /مساعدة للأمثلة. (فهم النص الحر يتفعّل بإضافة مفتاح Anthropic في ملف .env)',\n      'النص_الأصلي': line.fallback } } });\n    return;\n  }\n  const prompt = 'أنت طبقة استخراج بيانات في نظام محاسبة. حوّل الرسالة العربية العامية التالية إلى JSON حسب المخطط المفروض.\\n' +\n    'جدول التجديدات (المفتاح ← التكلفة):\\n' + pricingTable + '\\n' +\n    'الحسابات: ' + Object.values(config.accounts).join(' · ') + '\\nالمواقع: ' + config.sites.join(' · ') + '\\n' +\n    'تاريخ اليوم: ' + base.date + '\\nمرسل الرسالة: ' + ctx.sender + '\\n' +\n    'القواعد: أي معلومة غير موجودة صراحة = null ولا تخمن أبداً. المبلغ من الرسالة لا من جدول التسعير (استثناء: بيع بلاستيك بلا مبلغ = تكلفته). ' +\n    '\"ورد/دخل/استلمت/اجاني\"=وارد، \"دفعت/صادر/طلع\"=صادر. \"امبارح\"=اليوم-1. ' +\n    'نوع_التجديد بصيغة \"الشريحة - المدة - الموقع\": الشريحة والمدة كما في الجدول، والموقع المذكور بالرسالة (وإلا ليان) حتى لو لم يكن مفتاح ذلك الموقع في الجدول. \"وي\" تعني ويكوم. ' +\n    '\"بنك/البنك\" = بنك فلسطين، \"اسلامي\" = البنك الإسلامي الفلسطيني. \"المحفظة\" وحدها ملتبسة (بال باي/جوال باي) = يحتاج_توضيح بسؤال عربي قصير واحد. ' +\n    '\"بالدين / آجل / بعدين يدفع / لسا ما دفع\" = الحساب آجل. \"سدد الدين / حوّل اللي عليه\" = تحويل_داخلي من آجل إلى الحساب المذكور. ' +\n    (ctx.senderExpenses ? 'مصروف شخصي بلا وجهة = ' + ctx.senderExpenses + ' (هوية المرسل). ' : 'مصروف شخصي بلا وجهة محددة = يحتاج_توضيح: لمن؟ ') +\n    'الثقة أقل من 0.7 = يحتاج_توضيح.\\n\\nالرسالة: «' + fbText + '»';\n  out.push({ json: { ...base, needsLLM: true, fallbackText: fbText,\n    llmBody: { model: $env.ANTHROPIC_MODEL || 'claude-opus-5', max_tokens: 2000,\n      output_config: { effort: 'low', format: { type: 'json_schema', schema } },\n      messages: [{ role: 'user', content: prompt }] } } });\n});\nallOut.push(...out);\n});\nreturn allOut;\n"
+      }
+    },
+    {
+      "id": "n012",
+      "name": "يحتاج النموذج؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        560
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ String($json.needsLLM) }}",
+              "value2": "true"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n013",
+      "name": "استخراج بالنموذج",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        140,
+        460
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llmBody) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "n014",
+      "name": "قراءة رد النموذج",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        460
+      ],
+      "parameters": {
+        "jsCode": "\nconst fallbacks = $('المحلل').all().filter((s) => s.json.needsLLM);\nconst out = [];\n$input.all().forEach((item, idx) => {\n  const resp = item.json;\n  const ctx = (fallbacks[idx] && fallbacks[idx].json) || {};\n  let op = null; let clarifyQ = null;\n  if (resp.stop_reason === 'refusal') {\n    clarifyQ = 'تعذّر فهم الرسالة — أعد صياغتها.';\n  } else {\n    try {\n      const txt = (resp.content || []).find((b) => b.type === 'text');\n      op = JSON.parse(txt.text);\n    } catch (e) { clarifyQ = 'تعذّر تحليل الرسالة — أعد الإرسال بصيغة أوضح أو بالصيغة المختصرة.'; }\n  }\n  if (op) {\n    op['النص_الأصلي'] = ctx.fallbackText || '';\n    if (op['يحتاج_توضيح']) { clarifyQ = op['سؤال_التوضيح'] || 'وضّح العملية أكثر.'; op = null; }\n  }\n  out.push({ json: { ...ctx, op: op || { 'يحتاج_توضيح': true, 'سؤال_التوضيح': clarifyQ, 'النص_الأصلي': ctx.fallbackText || '' }, needsLLM: false, llmBody: undefined } });\n});\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n015",
+      "name": "خطة الكتابة",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        560
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst st = $getWorkflowStaticData('global');\nst.pendingSettle = st.pendingSettle || {};\nst.clarify = st.clarify || {};\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (j.wiz) { out.push({ json: { stage: 'wiz', chatId: j.chatId, text: j.text, kb: j.kb } }); continue; }\n  const op = j.op;\n  const key = j.msgId + (j.opCount > 1 ? ':' + j.opIndex : '');\n  const D = j.date; const fx = j.config.fxRate;\n  const opLabel = j.opCount > 1 ? ' (عملية ' + (j.opIndex + 1) + '/' + j.opCount + ')' : '';\n\n  if (op['يحتاج_توضيح']) {\n    st.clarify[j.chatId] = { v: 2, text: op['النص_الأصلي'] || j.text, ts: Date.now() };\n    out.push({ json: { stage: 'ask', chatId: j.chatId, replyTo: j.replyTo, text: '❓ ' + (op['سؤال_التوضيح'] || 'وضّح العملية.') + opLabel + '\\n📝 «' + (op['النص_الأصلي'] || j.text) + '»\\nأجب على هذه الرسالة أو أعد الإرسال كاملاً.' } });\n    continue;\n  }\n\n  const type = op['نوع_العملية'];\n  const amt = op['المبلغ'];\n  const acc = op['الحساب'];\n  const writes = []; // { code, values: مصفوفة بطول width تبدأ من A مع null للمعادلات }\n  function row(code, map) { const s = SHEETS[code]; const v = new Array(s.width).fill(null); for (const [col, val] of Object.entries(map)) v[col.charCodeAt(0) - 65] = val; writes.push({ code, values: v }); }\n  let receipt = ''; let warn = '';\n\n  if (type === 'بيع' || type === 'بيع_بلاستيك') {\n    let cost = op._derived && op._derived.cost !== undefined ? op._derived.cost : j.config.pricing[op['نوع_التجديد']];\n    if (cost === undefined || cost === null) {\n      // مفتاح موقع غير مُدرج في جدول التسعير (من النموذج اللغوي): التكلفة موحّدة — خذ تكلفة الموقع الافتراضي\n      const parts = String(op['نوع_التجديد'] || '').split(' - ');\n      if (parts.length === 3) cost = j.config.pricing[parts[0] + ' - ' + parts[1] + ' - ' + (j.config.defaultSite || 'ليان')];\n    }\n    if (cost === undefined || cost === null) {\n      st.clarify[j.chatId] = { v: 2, text: op['النص_الأصلي'] || j.text, ts: Date.now() };\n      out.push({ json: { stage: 'ask', chatId: j.chatId, replyTo: j.replyTo, text: '❓ تكلفة «' + (op['نوع_التجديد'] || 'الباقة') + '» غير مُدخلة في جدول التسعير — أدخلها ثم أعد الإرسال.' + opLabel } });\n      continue;\n    }\n    const profit = amt - cost;\n    const chip = (op._derived && (op._derived.chip || (op._derived.stock && op._derived.stock.chip))) || String(op['نوع_التجديد'] || '').split(' - ')[0] || null;\n    const siteLit = type === 'بيع_بلاستيك' ? 'مخزون' : op['الموقع'];\n    // الشريحة والموقع والتكلفة تُكتب قيماً ثابتة: يجعل الخصم يعمل لكل المواقع دون تكرار صفوف التسعير\n    row('b', { B: D, C: op['المنفّذ'] || 'أنا', D: op['اسم_العميل'], E: op['معرف_الاشتراك'], F: op['نوع_التجديد'], G: amt, H: chip, I: siteLit, J: cost, L: acc, M: 'مؤكد', P: key });\n    row('m', { B: D, C: (type === 'بيع_بلاستيك' ? 'بيع شريحة بلاستيك' : 'تجديد') + (op['اسم_العميل'] ? ' — ' + op['اسم_العميل'] : ''), D: 'مبيعات / تجديد', E: 'وارد', F: acc, G: 'شيكل', I: amt, N: 'مؤكد', P: key });\n    receipt = '📥 وارد ' + amt + ' ₪ · ' + acc + '\\n🔄 ' + op['نوع_التجديد'] + '\\n➖ التكلفة: ' + cost + ' ₪ · 💰 الربح: ' + profit + ' ₪';\n    if (type === 'بيع_بلاستيك') {\n      const chip = op._derived && op._derived.stock ? op._derived.stock.chip : '';\n      const left = (j.inventory[chip] || 0) - 1;\n      receipt += '\\n📦 مخزون ' + chip + ' بعد البيع: ' + left;\n      if (left <= 0) warn = '⚠️ مخزون ' + chip + ' نفد أو تحت الحد!';\n    } else {\n      const site = op['الموقع'];\n      const bal = (j.siteBalances[site] || 0) - cost;\n      receipt += '\\n🏝 رصيد ' + site + ' التقريبي بعد الخصم: ' + bal + ' ₪';\n    }\n    if (acc === 'آجل') receipt += '\\n💳 بيع آجل — يبقى ديناً على العميل. عند السداد أرسل: حول اجل <الحساب> ' + amt;\n  } else if (type === 'مصروف_بيت' || type === 'مصروف_اسامة' || type === 'مصروف_انس') {\n    const code = type === 'مصروف_بيت' ? '1' : type === 'مصروف_اسامة' ? '2' : '3';\n    row(code, { B: D, C: op['البند'] || '', D: op['التصنيف'], E: amt, F: acc, G: 'مؤكد', I: key });\n    row('m', { B: D, C: (op['البند'] || 'مصروف'), D: type === 'مصروف_بيت' ? 'مصروف بيت' : type === 'مصروف_اسامة' ? 'مصروف أسامة' : 'مصروف أنس', E: 'صادر', F: acc, G: 'شيكل', J: amt, N: 'مؤكد', P: key });\n    receipt = '📤 صادر ' + amt + ' ₪ · ' + acc + '\\n🏷 ' + SHEETS[code].name + (op['البند'] ? ' — ' + op['البند'] : '');\n  } else if (type === 'شحن_رصيد') {\n    row('c', { A: D, B: op['الموقع'], C: amt, D: acc, E: key });\n    row('m', { B: D, C: 'شحن رصيد موقع ' + op['الموقع'], D: 'شحن رصيد موقع', E: 'صادر', F: acc, G: 'شيكل', J: amt, N: 'مؤكد', P: key });\n    receipt = '⚡ شحن ' + op['الموقع'] + ': ' + amt + ' ₪ من ' + acc;\n  } else if (type === 'تحويل_داخلي') {\n    row('m', { B: D, C: 'تحويل إلى ' + op['الحساب_المقابل'], D: 'تحويل بين الحسابات', E: 'صادر', F: acc, G: 'شيكل', J: amt, N: 'مؤكد', P: key });\n    row('m', { B: D, C: 'تحويل من ' + acc, D: 'تحويل بين الحسابات', E: 'وارد', F: op['الحساب_المقابل'], G: 'شيكل', I: amt, N: 'مؤكد', P: key });\n    receipt = '🔁 تحويل ' + amt + ' ₪: ' + acc + ' ← ' + op['الحساب_المقابل'];\n  } else if (type === 'شراء_USDT' || type === 'بيع_USDT') {\n    const shekel = Math.round(amt * fx * 100) / 100;\n    if (type === 'شراء_USDT') {\n      row('m', { B: D, C: 'شراء ' + amt + ' USDT', D: 'تحويل بين الحسابات', E: 'صادر', F: op['الحساب_المقابل'], G: 'شيكل', J: shekel, N: 'مؤكد', P: key });\n      row('m', { B: D, C: 'شراء USDT — سعر مثبّت ' + fx, D: 'تحويل بين الحسابات', E: 'وارد', F: 'محفظة بايننس', G: 'USDT', H: fx, I: amt, N: 'مؤكد', P: key });\n      receipt = '🪙 شراء ' + amt + ' USDT × ' + fx + ' = ' + shekel + ' ₪ من ' + op['الحساب_المقابل'];\n    } else {\n      row('m', { B: D, C: 'بيع ' + amt + ' USDT — سعر مثبّت ' + fx, D: 'تحويل بين الحسابات', E: 'صادر', F: 'محفظة بايننس', G: 'USDT', H: fx, J: amt, N: 'مؤكد', P: key });\n      row('m', { B: D, C: 'بيع USDT', D: 'تحويل بين الحسابات', E: 'وارد', F: op['الحساب_المقابل'], G: 'شيكل', I: shekel, N: 'مؤكد', P: key });\n      receipt = '🪙 بيع ' + amt + ' USDT × ' + fx + ' = ' + shekel + ' ₪ إلى ' + op['الحساب_المقابل'];\n    }\n  } else if (type === 'تسديد') {\n    row('p', { A: D, B: op['المنفّذ'] || 'أبو حسام', C: amt, D: acc, E: key });\n    row('m', { B: D, C: 'تسديد من ' + (op['المنفّذ'] || 'أبو حسام'), D: 'تسديد من منفّذ', E: 'وارد', F: acc, G: 'شيكل', I: amt, N: 'مؤكد', P: key });\n    receipt = '🤝 تسديد ' + amt + ' ₪ من ' + (op['المنفّذ'] || 'أبو حسام') + ' على ' + acc;\n  } else if (type === 'تجديد_عائلي') {\n    // تكلفة التجديد مصروف على صاحبه + خصم من رصيد الموقع — بلا أي حركة نقدية\n    const cost = op._derived.cost;\n    const chip = op._derived.chip;\n    const expCode = op._derived.expenseType === 'مصروف_بيت' ? '1' : op._derived.expenseType === 'مصروف_اسامة' ? '2' : '3';\n    const who = op['اسم_العميل'];\n    row('b', { B: D, C: 'أنا', D: who, F: op['نوع_التجديد'], G: cost, H: chip, I: op['الموقع'], J: cost, M: 'مؤكد', N: 'تجديد عائلي — قُيّد مصروفاً', P: key });\n    row(expCode, { B: D, C: 'تجديد ' + chip + ' ' + (op._derived.dur || '') + ' (' + op['الموقع'] + ')', E: cost, G: 'مؤكد', H: 'من رصيد الموقع — بلا نقد', I: key });\n    receipt = '👪 تجديد عائلي (' + who + '): ' + op['نوع_التجديد'] +\n      '\\n➖ خصم ' + cost + ' ₪ من رصيد ' + op['الموقع'] +\n      ' · 💸 قُيّد ' + cost + ' ₪ على ' + SHEETS[expCode].name +\n      '\\nبلا حركة نقدية — الربح غير متأثر.';\n  } else if (type === 'كشف_حساب') {\n    const days = (op._derived && op._derived.days) || 30;\n    const sinceSerial = Math.floor(Date.now() / 86400000) - days + 25569; // تاريخ البداية بتسلسل جداول البيانات\n    // قراءة مزدوجة: حركات الحساب + أرصدة لوحة التحكم (للرصيد الحالي)\n    const stmtUrl = GS + '/values:batchGet?valueRenderOption=UNFORMATTED_VALUE'\n      + '&ranges=' + encodeURIComponent(\"'الحركات المالية'!A5:P304\")\n      + '&ranges=' + encodeURIComponent(\"'لوحة التحكم'!B17:H26\");\n    out.push({ json: { stage: 'statement', chatId: j.chatId, accountName: acc, days, sinceSerial, scanUrl: stmtUrl } });\n    continue;\n  } else if (type === 'خدمة_هيئة') {\n    row('f', { A: D, B: op['معرف_الاشتراك'], C: op['البند'], D: amt, E: op['اسم_العميل'], F: 'مؤكد', H: key });\n    row('m', { B: D, C: 'خدمة هيئة المستقبل — ' + (op['البند'] || ''), D: 'أخرى', E: 'صادر', F: acc, G: 'شيكل', J: amt, N: 'مؤكد', P: key });\n    row('m', { B: D, C: 'دين هيئة المستقبل — ' + (op['البند'] || ''), D: 'أخرى', E: 'وارد', F: 'هيئة المستقبل', G: 'شيكل', I: amt, N: 'مؤكد', P: key });\n    receipt = '🏛 خدمة هيئة المستقبل: ' + (op['البند'] || '—') + (op['معرف_الاشتراك'] ? '\\n📱 ' + op['معرف_الاشتراك'] : '') +\n      '\\n📤 ' + amt + ' ₪ من ' + acc + ' · 💳 أُضيف لدين الهيئة' +\n      (op['اسم_العميل'] ? '\\n👤 طالب الخدمة: ' + op['اسم_العميل'] : '') +\n      '\\nعند التسديد: حول هيئة <الحساب> <المبلغ>';\n  } else if (type === 'ملاحظة') {\n    row('n', { B: D, C: op['نص_الملاحظة'], D: 'مفتوحة', F: key });\n    receipt = '🗒 ملاحظة جديدة: «' + op['نص_الملاحظة'] + '»';\n  } else if (type === 'تسوية_مطابقة') {\n    // الاستثناء الوحيد الثالث: تثبيت التسوية خلف تأكيد\n    const site = op['الموقع'];\n    const actual = amt;\n    const computed = j.siteBalances[site] !== undefined ? j.siteBalances[site] : null;\n    if (computed === null) {\n      out.push({ json: { stage: 'ask', chatId: j.chatId, replyTo: j.replyTo, text: '❓ لا أجد رصيداً محسوباً للموقع ' + site } });\n      continue;\n    }\n    const diff = Math.round((actual - computed) * 100) / 100;\n    if (diff === 0) {\n      out.push({ json: { stage: 'ask', chatId: j.chatId, replyTo: j.replyTo, text: '✅ ' + site + ' مطابق تماماً (' + computed + ' ₪) — لا حاجة لتسوية.' } });\n      continue;\n    }\n    if (diff > 0) {\n      out.push({ json: { stage: 'ask', chatId: j.chatId, replyTo: j.replyTo, text: '⚠️ فرق موجب في ' + site + ': الفعلي ' + actual + ' والمحسوب ' + computed + ' (+' + diff + ' ₪).\\nلا يُثبَّت على أحد — راجع سجل الشحن، فالغالب شحن غير مسجّل.' } });\n      continue;\n    }\n    const withdrawal = Math.abs(diff);\n    st.pendingSettle[key] = { ts: Date.now(), chatId: j.chatId, writes: [ { code: 'w', values: (() => { const v = new Array(6).fill(null); v[0] = D; v[1] = site; v[2] = withdrawal; v[3] = 'أبو حسام'; v[4] = actual; v[5] = key; return v; })() } ], receipt: '⚖️ تسوية ' + site + ': ثُبّت سحب ' + withdrawal + ' ₪ على أبي حسام (الفعلي ' + actual + ' ₪).' };\n    out.push({ json: { stage: 'confirm', chatId: j.chatId, replyTo: j.replyTo, settleKey: key,\n      text: '⚖️ مطابقة ' + site + opLabel + '\\nالمحسوب: ' + computed + ' ₪ · الفعلي: ' + actual + ' ₪ · الفرق: ' + diff + ' ₪\\n\\n⚠️ تأكد أن كل عملياتك مسجّلة أولاً — أي عملية منسية ستُحسب ديناً على أبي حسام.\\nتثبيت ' + withdrawal + ' ₪ سحباً على أبي حسام؟' } });\n    continue;\n  } else {\n    // حركة عامة أو ترحيل\n    const route = op._derived && op._derived.route === 'حركات للترحيل';\n    if (route) {\n      row('t', { B: D, C: acc, D: op['الاتجاه'], E: amt, F: op['النص_الأصلي'], H: 'بانتظار الترحيل', K: key });\n      receipt = '📮 أُودعت في «حركات للترحيل» بانتظار التوجيه: ' + amt + ' ₪ ' + (op['الاتجاه'] || '') + ' · ' + acc + '\\nاستعمل /معلق و /رحل لاحقاً.';\n    } else {\n      const cur = op['العملة'] || 'شيكل';\n      const isUSDT = cur === 'USDT';\n      row('m', { B: D, C: op['البند'] || 'حركة عامة', D: op['التصنيف'] || 'أخرى', E: op['الاتجاه'], F: acc, G: cur, H: isUSDT ? fx : null, I: op['الاتجاه'] === 'وارد' ? amt : null, J: op['الاتجاه'] === 'صادر' ? amt : null, N: 'مؤكد', P: key });\n      receipt = (op['الاتجاه'] === 'وارد' ? '📥 وارد ' : '📤 صادر ') + amt + ' ' + (isUSDT ? 'USDT (× ' + fx + ')' : '₪') + ' · ' + acc + (op['البند'] ? '\\n🏷 ' + op['البند'] : '');\n    }\n  }\n\n  const sheetCodes = [...new Set(writes.map((w) => w.code))].join('');\n  writes.forEach((w, wi) => {\n    out.push({ json: { stage: 'write', chatId: j.chatId, replyTo: j.replyTo, msgKey: key, opKey: key, writeIndex: wi,\n      code: w.code, values: w.values, scanUrl: scanUrl(w.code),\n      receipt: wi === 0 ? '✅ تم التسجيل' + opLabel + '\\n' + receipt + '\\n📅 ' + D + '\\n📝 «' + (op['النص_الأصلي'] || j.text) + '»' + (warn ? '\\n' + warn : '') : null,\n      undoData: 'undo:' + key + ':' + sheetCodes } });\n  });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n016",
+      "name": "كتابة؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        800,
+        560
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.stage }}",
+              "value2": "write"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n017",
+      "name": "كشف؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        840
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.stage }}",
+              "value2": "statement"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n018",
+      "name": "قراءة الكشف",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1240,
+        900
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.scanUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n019",
+      "name": "تنسيق الكشف",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1460,
+        900
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst plan = $('خطة الكتابة').itemMatching($itemIndex).json;\nconst ranges = $json.valueRanges || [];\nconst rows = (ranges[0] && ranges[0].values) || $json.values || [];\nconst dash = (ranges[1] && ranges[1].values) || [];\nconst esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nlet inSum = 0; let outSum = 0; const lines = [];\nfor (const r of rows) {\n  if (!r || r[1] === undefined || r[1] === '') continue;\n  if (String(r[5] || '') !== String(plan.accountName)) continue;\n  if (String(r[13] || '') !== 'مؤكد') continue;\n  const serial = typeof r[1] === 'number' ? r[1] : null;\n  if (serial !== null && serial < plan.sinceSerial) continue;\n  const dt = serial !== null ? new Date((serial - 25569) * 86400000).toISOString().slice(0, 10) : String(r[1]);\n  const inc = parseFloat(r[10]) || 0;\n  const outv = parseFloat(r[11]) || 0;\n  inSum += inc; outSum += outv;\n  lines.push(dt + ' · ' + esc(r[2] || '—') + ' · ' + (inc ? '+' + inc : '-' + outv) + ' ₪');\n}\nconst MAX = 40;\nconst body = lines.slice(-MAX).join('\\n');\nconst note = lines.length > MAX ? '\\n(عرضت آخر ' + MAX + ' من أصل ' + lines.length + ' حركة)' : '';\nconst net = Math.round((inSum - outSum) * 100) / 100;\n// الرصيد الحالي من لوحة التحكم (العمود G بالعملة، H بالشيكل)\nlet balLine = '';\nfor (const dr of dash) {\n  if (dr && String(dr[0] || '') === String(plan.accountName)) {\n    const cur = String(dr[1] || 'شيكل');\n    const balCur = Math.round((parseFloat(dr[5]) || 0) * 100) / 100;\n    const balIls = Math.round((parseFloat(dr[6]) || 0) * 100) / 100;\n    balLine = '\\n💰 الرصيد الحالي: ' + (cur === 'شيكل' ? balIls + ' ₪' : balCur + ' ' + cur + ' (' + balIls + ' ₪)');\n    break;\n  }\n}\nconst text = '📄 كشف ' + plan.accountName + ' — آخر ' + plan.days + ' يوم\\n\\n' +\n  (body || 'لا حركات مؤكدة في هذه المدة.') + note +\n  '\\n\\n📥 وارد: ' + inSum + ' ₪ · 📤 صادر: ' + outSum + ' ₪ · الصافي: ' + net + ' ₪' + balLine;\nreturn { json: { chatId: plan.chatId, text } };\n"
+      }
+    },
+    {
+      "id": "n020",
+      "name": "تأكيد تسوية؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        700
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.stage }}",
+              "value2": "confirm"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n021",
+      "name": "مسح الصفوف",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.scanUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n022",
+      "name": "تحديد الصف",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        460
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst resps = $input.all();\nfunction planFor(i) {\n  // مطابقة العنصر بمصدره عبر سلسلة pairedItem — صامدة أمام تعدد الفروع وترتيب العناصر\n  try { const p = $('خطة الكتابة').itemMatching(i); if (p && p.json && p.json.stage === 'write') return p.json; } catch (e) {}\n  try { const p = $('قراءة الزر').itemMatching(i); if (p && p.json && p.json.stage === 'write') return p.json; } catch (e) {}\n  throw new Error('تعذر مطابقة خطة الكتابة للعنصر رقم ' + i);\n}\nconst allocated = {}; // code → الصف الفارغ التالي في هذا التنفيذ\nconst out = [];\nresps.forEach((respItem, i) => {\n  const plan = planFor(i);\n  const sheet = SHEETS[plan.code];\n  const data = respItem.json.values || [];\n  const existing = data.filter((r) => String((r || [])[sheet.msgCol] || '') === String(plan.msgKey)).length;\n  const skip = existing > plan.writeIndex; // إعادة إرسال: الصف موجود مسبقاً\n  let firstEmpty = null;\n  for (let r = 0; r < data.length + 1; r++) {\n    const row = data[r] || [];\n    if (row[sheet.keyCol] === undefined || row[sheet.keyCol] === '') { firstEmpty = sheet.base + r; break; }\n  }\n  const maxRow = parseInt(sheet.scan.match(/(\\d+)$/)[1], 10);\n  if (firstEmpty === null || firstEmpty > maxRow) {\n    if (!skip) throw new Error('لا يوجد صف فارغ في ' + sheet.name + ' — وسّع الجدول');\n    firstEmpty = maxRow;\n  }\n  if (allocated[plan.code] === undefined || allocated[plan.code] < firstEmpty) allocated[plan.code] = firstEmpty;\n  let target = null;\n  if (!skip) { target = allocated[plan.code]; allocated[plan.code]++; }\n  out.push({ json: { ...plan, skip, targetRow: target,\n    putUrl: skip ? null : rowUrl(plan.code, target),\n    body: skip ? null : { values: [plan.values] } } });\n});\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n023",
+      "name": "صف جديد؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ String($json.skip) }}",
+              "value2": "false"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n024",
+      "name": "كتابة الصف",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        380
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $json.putUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n025",
+      "name": "تجهيز ما كُتب",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        460
+      ],
+      "parameters": {
+        "jsCode": "return $(\"تحديد الصف\").all().map((i) => ({ json: i.json }));"
+      }
+    },
+    {
+      "id": "n026",
+      "name": "بناء الإيصال",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2120,
+        460
+      ],
+      "parameters": {
+        "jsCode": "\nconst groups = {};\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!groups[j.opKey]) groups[j.opKey] = { chatId: j.chatId, replyTo: j.replyTo, undoData: j.undoData, receipt: null, rows: [], skipped: 0 };\n  if (j.receipt) groups[j.opKey].receipt = j.receipt;\n  if (j.skip) groups[j.opKey].skipped++; else groups[j.opKey].rows.push(j.targetRow);\n}\nreturn Object.values(groups).map((g) => ({ json: {\n  chatId: g.chatId, replyTo: g.replyTo, undoData: g.undoData,\n  text: (g.receipt || '✅ تم التسجيل') + (g.skipped ? '\\nℹ️ ' + g.skipped + ' صف كان مسجلاً سابقاً (لا تكرار).' : ''),\n} }));\n"
+      }
+    },
+    {
+      "id": "n027",
+      "name": "إرسال الإيصال",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2340,
+        460
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ تراجع",
+                    "additionalFields": {
+                      "callback_data": "={{ $json.undoData }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n028",
+      "name": "إرسال سؤال",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1240,
+        780
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n029",
+      "name": "طلب تأكيد التسوية",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1240,
+        640
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        },
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ ثبّت على أبي حسام",
+                    "additionalFields": {
+                      "callback_data": "={{ 'settle:ok:' + $json.settleKey }}"
+                    }
+                  },
+                  {
+                    "text": "❌ إلغاء",
+                    "additionalFields": {
+                      "callback_data": "={{ 'settle:no:' + $json.settleKey }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n030",
+      "name": "خطوة معالج؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        840
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.stage }}",
+              "value2": "wiz"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n031",
+      "name": "إرسال خطوة المعالج",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1240,
+        900
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/sendMessage' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $json.chatId, text: $json.text, reply_markup: $json.kb ? { inline_keyboard: $json.kb } : undefined }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n032",
+      "name": "رد على الزر",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -740,
+        140
+      ],
+      "parameters": {
+        "resource": "callback",
+        "queryId": "={{ $json.callbackId }}"
+      },
+      "onError": "continueRegularOutput",
+      "continueOnFail": true,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n033",
+      "name": "قراءة الزر",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        140
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst st = $getWorkflowStaticData('global');\nst.pendingSettle = st.pendingSettle || {};\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const d = j.data || '';\n  if (d.startsWith('settle:no:')) {\n    delete st.pendingSettle[d.slice(10)];\n    out.push({ json: { action: 'msg', chatId: j.chatId, text: '👍 أُلغيت التسوية — لم يُكتب شيء.' } });\n  } else if (d.startsWith('settle:ok:')) {\n    const key = d.slice(10);\n    const p = st.pendingSettle[key];\n    if (!p) { out.push({ json: { action: 'msg', chatId: j.chatId, text: '⌛ انتهت صلاحية طلب التسوية — أعد إرسال «مطابقة ...».' } }); continue; }\n    delete st.pendingSettle[key];\n    p.writes.forEach((w, wi) => out.push({ json: { action: 'write', stage: 'write', chatId: j.chatId, replyTo: null, msgKey: key, opKey: key, writeIndex: wi, code: w.code, values: w.values, scanUrl: scanUrl(w.code), receipt: wi === 0 ? p.receipt : null, undoData: 'undo:' + key + ':w' } }));\n  } else if (d.startsWith('undo:')) {\n    const parts = d.split(':');\n    const key = parts[1];\n    const codes = (parts[2] || 'bm123tncwp').split('');\n    codes.forEach((code) => out.push({ json: { action: 'undo', chatId: j.chatId, msgKey: key, code, scanUrl: scanUrl(code) } }));\n  } else if (d.startsWith('wz:')) {\n    st.wizard = st.wizard || {};\n    const parts = d.split(':');\n    const act = parts[1]; const val = parts[2];\n    if (act === 'cancel') {\n      delete st.wizard[j.chatId];\n      out.push({ json: { action: 'wiz', stage: 'wiz', chatId: j.chatId, text: '👍 أُلغي المعالج.', kb: null } });\n    } else {\n      const wiz = st.wizard[j.chatId] || { step: 'acc', d: {}, ts: Date.now() };\n      wiz.ts = Date.now();\n      if (act === 'acc') { wiz.d.acc = val; wiz.step = 'chip'; }\n      else if (act === 'chip') { wiz.d.chip = val; wiz.step = 'dur'; }\n      else if (act === 'dur') { wiz.d.dur = val; wiz.step = val === 'بلاستيك' ? 'amt' : 'site'; }\n      else if (act === 'site') { wiz.d.site = val; wiz.step = 'amt'; }\n      st.wizard[j.chatId] = wiz;\n      const ui = wizUI(wiz.step);\n      out.push({ json: { action: 'wiz', stage: 'wiz', chatId: j.chatId, text: ui.text, kb: ui.kb } });\n    }\n  } else {\n    out.push({ json: { action: 'msg', chatId: j.chatId, text: 'زر غير معروف.' } });\n  }\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n034",
+      "name": "تثبيت تسوية؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -300,
+        140
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.action }}",
+              "value2": "write"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n035",
+      "name": "تراجع؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.action }}",
+              "value2": "undo"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n036",
+      "name": "مسح للتراجع",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        140,
+        140
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.scanUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n037",
+      "name": "خلايا الإلغاء",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        140
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst resp = $json;\nconst plan = $('قراءة الزر').itemMatching($itemIndex).json;\nconst s = SHEETS[plan.code];\nconst data = resp.values || [];\nconst updates = [];\nfor (let i = 0; i < data.length; i++) {\n  const r = data[i] || [];\n  if (String(r[s.msgCol] || '') !== String(plan.msgKey)) continue;\n  const rowNum = s.base + i;\n  if (s.statusCol) {\n    updates.push({ range: \"'\" + s.name + \"'!\" + s.statusCol + rowNum, values: [['ملغى']] });\n  } else {\n    const endCol = String.fromCharCode(64 + s.width);\n    updates.push({ range: \"'\" + s.name + \"'!A\" + rowNum + ':' + endCol + rowNum, values: [new Array(s.width).fill('')] });\n  }\n}\nreturn { json: { chatId: plan.chatId, msgKey: plan.msgKey, found: updates.length,\n  batchUrl: updates.length ? GS + '/values:batchUpdate' : null,\n  batchBody: updates.length ? { valueInputOption: 'USER_ENTERED', data: updates } : null } };\n"
+      }
+    },
+    {
+      "id": "n038",
+      "name": "يوجد ما يُلغى؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        580,
+        140
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ String($json.found > 0) }}",
+              "value2": "true"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n039",
+      "name": "تنفيذ الإلغاء",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.batchUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.batchBody) }}",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n040",
+      "name": "تلخيص الإلغاء",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        140
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\n// العدّاد يُقرأ من عقدة «خلايا الإلغاء» نفسها — مخرجات HTTP بعدها هي رد جوجل ولا تحمل found\nlet items;\ntry { items = $('خلايا الإلغاء').all(); } catch (e) { items = $input.all(); }\nlet found = 0; let chatId = null;\nfor (const item of items) { found += item.json.found || 0; chatId = chatId || item.json.chatId; }\nchatId = chatId || OWNER;\nreturn [{ json: { chatId, text: found ? '↩️ تم الإلغاء — ' + found + ' صف عُلّم «ملغى» أو مُسح، والأرصدة عادت لما قبل العملية.' : '⚠️ لم أجد صفوفاً بهذا المعرّف (ربما أُلغيت سابقاً).' } }];\n"
+      }
+    },
+    {
+      "id": "n041",
+      "name": "رسالة الإلغاء",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1240,
+        140
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n042",
+      "name": "رسالة الزر",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        280
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n043",
+      "name": "خطوة معالج زر؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.stage }}",
+              "value2": "wiz"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n044",
+      "name": "الأوامر",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        20
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst out = [];\nfor (const item of $input.all()) {\nconst j = item.json;\nconst cmd = j.text.split(/\\s+/)[0].replace('/', '');\nconst TPL = ['وارد بال 150 وي 3ش الاسم','وارد كاش 150 وي 3ش الاسم','وارد اجل 150 وي 3ش الاسم','وارد كاش 40 بلاستيك وي الاسم','هيئة 0590000000 64 خالد فاتورة شهر 7','حول هيئة بال 500','حول جوال جوالي 100','كشف فلسطين شهر','كشف هيئة اسبوع','وي 1ش الوها انس','صادر فلسطين 50 بيت البيان','صادر كاش 50 بيت البيان','حول اجل بال 150','حول فلسطين بال 200','شحن ليان 500 فلسطين','شراء بايننس 100 فلسطين','مطابقة ليان -150','سدد 300 فلسطين','ملاحظة نص الملاحظة'];\nconst TPLTEXT = '📌 القوالب — المس أي سطر يُنسَخ، عدّل وأرسل:\\n\\n' + TPL.map((t) => '<code>' + t + '</code>').join('\\n') + '\\n\\nوي=ويكوم · 3ش=3 شهور · ش=شهر · اجل=بيع دين';\nconst HELP = '🤖 /قوالب — سطور جاهزة تنسخها بلمسة وتعدّل الرقم والاسم فقط (مثبتة أيضاً أعلى المحادثة).\\n\\nالأوامر: /رصيد /قوالب /مساعدة\\n(بقية الأوامر — /اليوم /شهر /معلق /رحل /تم /ملاحظات /ذمم /كشف /سعر /فحص — في المرحلة 4)\\n\\n📝 صيغ سريعة:\\n' +\n 'وارد بال 60 وي شهر احمد\\nشريحة وي 3 شهور 150 بال\\nوارد كاش 40 بلاستيك سيليكوم\\nوارد اجل 60 وي شهر احمد ← بيع دَين\\nحول اجل بال 60 ← العميل سدد دينه\\nصادر اسلامي 300 بيت إيجار\\nشحن ليان 500 فلسطين\\nحول فلسطين بال 200\\nشراء بايننس 100 فلسطين\\nمطابقة ليان -150\\nسدد 300 فلسطين\\nملاحظة اشتري شرائح\\n\\n«وي» = ويكوم · «3ش» = 3 شهور · «ش» = شهر. كل رسالة واضحة تُسجَّل فوراً ويصلك إيصال بزر تراجع.';\nif (cmd === 'رصيد' || cmd === 'balance') out.push({ json: { needDash: true, chatId: j.chatId } });\nelse if (cmd === 'قوالب' || cmd === 'templates') out.push({ json: { needDash: false, chatId: j.chatId, text: TPLTEXT } });\nelse if (cmd === 'صوت') out.push({ json: { needDash: false, chatId: j.chatId, text: '🎤 الرسائل الصوتية تصل في المرحلة 5 — اكتب نصاً حالياً.' } });\nelse if (cmd === 'مساعدة' || cmd === 'start' || cmd === 'help') out.push({ json: { needDash: false, chatId: j.chatId, text: HELP } });\nelse out.push({ json: { needDash: false, chatId: j.chatId, text: 'الأمر /' + cmd + ' يُنجز في المرحلة 4.\\n' + HELP } });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n045",
+      "name": "قراءة اللوحة؟",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        -300,
+        20
+      ],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ String($json.needDash) }}",
+              "value2": "true"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n046",
+      "name": "قراءة اللوحة",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -80,
+        -40
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEET_ID + '/values:batchGet?valueRenderOption=UNFORMATTED_VALUE' + '&ranges=' + encodeURIComponent(\"'لوحة التحكم'!B17:H26\") + '&ranges=' + encodeURIComponent(\"'أرصدة المواقع'!A5:P12\") + '&ranges=' + encodeURIComponent(\"'الإعدادات'!A106:G110\") }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n047",
+      "name": "تنسيق الرصيد",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        140,
+        -40
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nconst ranges = $json.valueRanges || [];\nconst dash = (ranges[0] && ranges[0].values) || [];\nconst sites = (ranges[1] && ranges[1].values) || [];\nconst inv = (ranges[2] && ranges[2].values) || [];\nconst ctx = $('الأوامر').all().length ? $('الأوامر').first().json : { chatId: OWNER };\nfunction n(x) { return x === undefined || x === '' ? '—' : (Math.round(parseFloat(x) * 100) / 100); }\nlet t = '📊 الأرصدة\\n\\n🏦 الحسابات:\\n';\nfor (const r of dash) { if (r && r[0] && r[6] !== undefined && r[6] !== '') t += '· ' + r[0] + ': ' + n(r[5]) + (String(r[1]) === 'USDT' ? ' USDT (' + n(r[6]) + ' ₪)' : ' ₪') + '\\n'; }\nt += '\\n🏝 المواقع:\\n';\nfor (const r of sites) { if (r && r[1]) t += '· ' + r[1] + ': ' + n(r[6]) + ' ₪' + (String(r[13] || '') === 'سقف دين' ? ' (متاح للسحب: ' + n(r[15]) + ' ₪)' : '') + '\\n'; }\nt += '\\n📦 مخزون البلاستيك:\\n';\nfor (const r of inv) { if (r && r[0]) t += '· ' + r[0] + ': ' + n(r[5]) + ' قطعة\\n'; }\nreturn [{ json: { chatId: ctx.chatId, text: t } }];\n"
+      }
+    },
+    {
+      "id": "n048",
+      "name": "رد الأوامر",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        360,
+        20
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "n049",
+      "name": "الملخص اليومي",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1400,
+        -160
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 21 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n050",
+      "name": "تذكير المطابقة",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1400,
+        -20
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * 5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n051",
+      "name": "نوع الملخص: يومي",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1180,
+        -160
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { summaryKind: 'daily' } }];"
+      }
+    },
+    {
+      "id": "n052",
+      "name": "نوع الملخص: أسبوعي",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1180,
+        -20
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: { summaryKind: 'weekly' } }];"
+      }
+    },
+    {
+      "id": "n053",
+      "name": "قراءة اللوحة للملخص",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -960,
+        -90
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $env.GOOGLE_SHEET_ID + '/values:batchGet?valueRenderOption=UNFORMATTED_VALUE' + '&ranges=' + encodeURIComponent(\"'لوحة التحكم'!B17:H26\") + '&ranges=' + encodeURIComponent(\"'أرصدة المواقع'!A5:P12\") + '&ranges=' + encodeURIComponent(\"'الإعدادات'!A106:G110\") }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "id": "n054",
+      "name": "تنسيق الملخص",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -740,
+        -90
+      ],
+      "parameters": {
+        "jsCode": "\nconst TZ = $env.TIMEZONE || 'Asia/Gaza';\nconst SHEET_ID = $env.GOOGLE_SHEET_ID;\nif (!SHEET_ID) throw new Error('GOOGLE_SHEET_ID غير معرّف في متغيرات البيئة');\nconst OWNER = String($env.CHAT_ID_OWNER || '');\nconst CHAT_IDS = {};\nif (OWNER) CHAT_IDS[OWNER] = { name: 'أنا', expenses: null };\nif ($env.CHAT_ID_OSAMA) CHAT_IDS[String($env.CHAT_ID_OSAMA)] = { name: 'أسامة', expenses: 'مصروف_اسامة' };\nif ($env.CHAT_ID_ANAS) CHAT_IDS[String($env.CHAT_ID_ANAS)] = { name: 'أنس', expenses: 'مصروف_انس' };\nconst GS = 'https://sheets.googleapis.com/v4/spreadsheets/' + SHEET_ID;\nfunction todayStr(ts) { return new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleDateString('en-CA', { timeZone: TZ }); }\n// خرائط الصفحات: المسح، عمود المفتاح، عمود معرف الرسالة (فهرس داخل نطاق المسح من A)، عمود الحالة\nconst SHEETS = {\n  b: { name: 'المبيعات والتجديدات', scan: 'A5:P204', base: 5, keyCol: 1, msgCol: 15, statusCol: 'M', width: 16 },\n  m: { name: 'الحركات المالية',     scan: 'A5:P304', base: 5, keyCol: 1, msgCol: 15, statusCol: 'N', width: 16 },\n  '1': { name: 'مصاريف البيت',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '2': { name: 'مصاريف أسامة',   scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  '3': { name: 'مصاريف أنس',     scan: 'A5:I154', base: 5, keyCol: 1, msgCol: 8, statusCol: 'G', width: 9 },\n  t: { name: 'حركات للترحيل',    scan: 'A5:K104', base: 5, keyCol: 1, msgCol: 10, statusCol: 'H', width: 11 },\n  n: { name: 'الملاحظات',        scan: 'A5:F104', base: 5, keyCol: 2, msgCol: 5, statusCol: 'D', width: 6 },\n  c: { name: 'أرصدة المواقع',    scan: 'A19:F78',  base: 19, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  w: { name: 'أرصدة المواقع',    scan: 'A82:F131', base: 82, keyCol: 0, msgCol: 5, statusCol: null, width: 6 },\n  p: { name: 'كشف حساب المنفّذين', scan: 'A16:F65', base: 16, keyCol: 0, msgCol: 4, statusCol: null, width: 6 },\n  f: { name: 'هيئة المستقبل', scan: 'A5:H154', base: 5, keyCol: 0, msgCol: 7, statusCol: 'F', width: 8 },\n};\nfunction scanUrl(code) { const s = SHEETS[code]; return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!\" + s.scan) + '?valueRenderOption=UNFORMATTED_VALUE'; }\nfunction rowUrl(code, row) {\n  const s = SHEETS[code];\n  const endCol = String.fromCharCode(64 + s.width);\n  return GS + '/values/' + encodeURIComponent(\"'\" + s.name + \"'!A\" + row + ':' + endCol + row) + '?valueInputOption=USER_ENTERED';\n}\n// معالج البيع بالأزرار — واجهة كل خطوة\nfunction wizUI(step) {\n  const b = (t, c) => ({ text: t, callback_data: c });\n  if (step === 'acc') return { text: '🛒 بيعة جديدة — على أي حساب استلمت؟', kb: [\n    [b('💵 كاش', 'wz:acc:كاش'), b('💳 بال باي', 'wz:acc:بال')],\n    [b('🏦 فلسطين', 'wz:acc:فلسطين'), b('🏦 الإسلامي', 'wz:acc:اسلامي')],\n    [b('📱 جوال باي', 'wz:acc:جوال'), b('🕓 آجل (دين)', 'wz:acc:اجل')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'chip') return { text: 'أي شريحة؟', kb: [\n    [b('وي (ويكوم)', 'wz:chip:وي'), b('سيليكوم', 'wz:chip:سيليكوم')],\n    [b('هوت موبايل', 'wz:chip:هوت'), b('بارتنر', 'wz:chip:بارتنر')],\n    [b('بيليفون', 'wz:chip:بيليفون')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'dur') return { text: 'المدة؟', kb: [\n    [b('شهر', 'wz:dur:شهر'), b('3 شهور', 'wz:dur:3ش')],\n    [b('📦 شريحة بلاستيك (مخزون)', 'wz:dur:بلاستيك')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'site') return { text: 'أي موقع؟', kb: [\n    [b('ليان', 'wz:site:ليان'), b('الوها', 'wz:site:الوها')],\n    [b('سكاي', 'wz:site:سكاي'), b('ارين', 'wz:site:ارين')],\n    [b('❌ إلغاء', 'wz:cancel')]] };\n  if (step === 'amt') return { text: '✍️ اكتب المبلغ واسم العميل (الاسم اختياري)\\nمثال: 150 فهد حلس', kb: null };\n  return { text: '👍 أُلغي المعالج.', kb: null };\n}\n\nlet kind = 'daily'; try { kind = $('نوع الملخص: أسبوعي').first().json.summaryKind; } catch (e) { try { kind = $('نوع الملخص: يومي').first().json.summaryKind; } catch (e2) {} }\nconst ranges = $json.valueRanges || [];\nconst dash = (ranges[0] && ranges[0].values) || [];\nconst sites = (ranges[1] && ranges[1].values) || [];\nconst inv = (ranges[2] && ranges[2].values) || [];\nfunction n(x) { return x === undefined || x === '' ? '—' : (Math.round(parseFloat(x) * 100) / 100); }\nif (kind === 'weekly') {\n  let t = '⏰ تذكير المطابقة الأسبوعي\\nسجّل عملياتك أولاً ثم افتح المواقع وأرسل:\\n';\n  for (const r of sites) { if (r && r[1]) t += '· مطابقة ' + r[1] + ' <الرصيد الفعلي>\\n'; }\n  t += '(القيمة قد تكون سالبة لليان)';\n  return [{ json: { chatId: OWNER, text: t } }];\n}\nlet t = '🌙 ملخص اليوم ' + todayStr() + '\\n\\n🏦 الحسابات:\\n';\nfor (const r of dash) { if (r && r[0] && r[6] !== undefined && r[6] !== '') t += '· ' + r[0] + ': ' + n(r[5]) + (String(r[1]) === 'USDT' ? ' USDT' : ' ₪') + '\\n'; }\nt += '\\n🏝 المواقع:\\n';\nfor (const r of sites) { if (r && r[1]) { t += '· ' + r[1] + ': ' + n(r[6]) + ' ₪'; const status = String(r[11] || ''); if (status.includes('⚠')) t += ' ' + status; t += '\\n'; } }\nt += '\\n📦 المخزون: ' + inv.filter((r) => r && r[0]).map((r) => r[0] + ' ' + n(r[5])).join(' · ');\nreturn [{ json: { chatId: OWNER, text: t } }];\n"
+      }
+    },
+    {
+      "id": "n055",
+      "name": "إرسال الملخص",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -520,
+        -90
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "telegramApi": {
+          "id": "SELECT_YOUR_CREDENTIAL",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "سحب الرسائل": {
+      "main": [
+        [
+          {
+            "node": "طلب التحديثات",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "طلب التحديثات": {
+      "main": [
+        [
+          {
+            "node": "جلب التحديثات",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "جلب التحديثات": {
+      "main": [
+        [
+          {
+            "node": "حجز التحديثات",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "حجز التحديثات": {
+      "main": [
+        [
+          {
+            "node": "توزيع التحديثات",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "تأكيد الاستلام",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "توزيع التحديثات": {
+      "main": [
+        [
+          {
+            "node": "فرز وتحقق",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "فرز وتحقق": {
+      "main": [
+        [
+          {
+            "node": "زر؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "زر؟": {
+      "main": [
+        [
+          {
+            "node": "قراءة الزر",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "رد على الزر",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "أمر؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "أمر؟": {
+      "main": [
+        [
+          {
+            "node": "الأوامر",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "قراءة الإعدادات",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة الإعدادات": {
+      "main": [
+        [
+          {
+            "node": "المحلل",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "المحلل": {
+      "main": [
+        [
+          {
+            "node": "يحتاج النموذج؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "يحتاج النموذج؟": {
+      "main": [
+        [
+          {
+            "node": "استخراج بالنموذج",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "خطة الكتابة",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "استخراج بالنموذج": {
+      "main": [
+        [
+          {
+            "node": "قراءة رد النموذج",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة رد النموذج": {
+      "main": [
+        [
+          {
+            "node": "خطة الكتابة",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "خطة الكتابة": {
+      "main": [
+        [
+          {
+            "node": "كتابة؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "كتابة؟": {
+      "main": [
+        [
+          {
+            "node": "مسح الصفوف",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "خطوة معالج؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "خطوة معالج؟": {
+      "main": [
+        [
+          {
+            "node": "إرسال خطوة المعالج",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "كشف؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "كشف؟": {
+      "main": [
+        [
+          {
+            "node": "قراءة الكشف",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "تأكيد تسوية؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة الكشف": {
+      "main": [
+        [
+          {
+            "node": "تنسيق الكشف",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تنسيق الكشف": {
+      "main": [
+        [
+          {
+            "node": "رد الأوامر",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تأكيد تسوية؟": {
+      "main": [
+        [
+          {
+            "node": "طلب تأكيد التسوية",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "إرسال سؤال",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "مسح الصفوف": {
+      "main": [
+        [
+          {
+            "node": "تحديد الصف",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تحديد الصف": {
+      "main": [
+        [
+          {
+            "node": "صف جديد؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "صف جديد؟": {
+      "main": [
+        [
+          {
+            "node": "كتابة الصف",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "تجهيز ما كُتب",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "كتابة الصف": {
+      "main": [
+        [
+          {
+            "node": "تجهيز ما كُتب",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تجهيز ما كُتب": {
+      "main": [
+        [
+          {
+            "node": "بناء الإيصال",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "بناء الإيصال": {
+      "main": [
+        [
+          {
+            "node": "إرسال الإيصال",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة الزر": {
+      "main": [
+        [
+          {
+            "node": "تثبيت تسوية؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تثبيت تسوية؟": {
+      "main": [
+        [
+          {
+            "node": "مسح الصفوف",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "تراجع؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تراجع؟": {
+      "main": [
+        [
+          {
+            "node": "مسح للتراجع",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "خطوة معالج زر؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "خطوة معالج زر؟": {
+      "main": [
+        [
+          {
+            "node": "إرسال خطوة المعالج",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "رسالة الزر",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "مسح للتراجع": {
+      "main": [
+        [
+          {
+            "node": "خلايا الإلغاء",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "خلايا الإلغاء": {
+      "main": [
+        [
+          {
+            "node": "يوجد ما يُلغى؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "يوجد ما يُلغى؟": {
+      "main": [
+        [
+          {
+            "node": "تنفيذ الإلغاء",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "تلخيص الإلغاء",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تنفيذ الإلغاء": {
+      "main": [
+        [
+          {
+            "node": "تلخيص الإلغاء",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تلخيص الإلغاء": {
+      "main": [
+        [
+          {
+            "node": "رسالة الإلغاء",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "الأوامر": {
+      "main": [
+        [
+          {
+            "node": "قراءة اللوحة؟",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة اللوحة؟": {
+      "main": [
+        [
+          {
+            "node": "قراءة اللوحة",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "رد الأوامر",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة اللوحة": {
+      "main": [
+        [
+          {
+            "node": "تنسيق الرصيد",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تنسيق الرصيد": {
+      "main": [
+        [
+          {
+            "node": "رد الأوامر",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "الملخص اليومي": {
+      "main": [
+        [
+          {
+            "node": "نوع الملخص: يومي",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تذكير المطابقة": {
+      "main": [
+        [
+          {
+            "node": "نوع الملخص: أسبوعي",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "نوع الملخص: يومي": {
+      "main": [
+        [
+          {
+            "node": "قراءة اللوحة للملخص",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "نوع الملخص: أسبوعي": {
+      "main": [
+        [
+          {
+            "node": "قراءة اللوحة للملخص",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "قراءة اللوحة للملخص": {
+      "main": [
+        [
+          {
+            "node": "تنسيق الملخص",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "تنسيق الملخص": {
+      "main": [
+        [
+          {
+            "node": "إرسال الملخص",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Gaza"
+  },
+  "pinData": {}
+}
