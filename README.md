@@ -86,7 +86,7 @@ Telegram  ⇄  n8n (laptop, 30s polling loop)
 **كيف يتعامل مع الانقطاع:** رسائلك تُخزَّن على سيرفرات تيليجرام. الجهاز مطفأ أو بلا نت؟ لا مشكلة —
 أول ما يشتغل ويتصل، يسحب كل ما تجمّع ويسجّله بالترتيب وتصلك الإيصالات دفعة واحدة.
 
-> ⚠️ **القيد الوحيد المهم: 24 ساعة.** تيليجرام يحتفظ برسائل البوت غير المسحوبة يوماً واحداً فقط.
+> **القيد الوحيد المهم: 24 ساعة.** تيليجرام يحتفظ برسائل البوت غير المسحوبة يوماً واحداً فقط.
 > الشرط: أن يتصل الجهاز بالنت مرة على الأقل كل 24 ساعة — وإلا انتقل لخيار الـ VPS.
 
 خطوات ويندوز:
@@ -112,7 +112,7 @@ Telegram  ⇄  n8n (laptop, 30s polling loop)
 3. **انشر/فعّل** الوورك فلو (زر Publish في نسخ n8n الحديثة — الحفظ وحده لا يشغّل المؤقتات).
 4. جرّب `/مساعدة` من تيليجرام — الرد خلال دورة سحب واحدة.
 
-### 🔒 خصوصية الشيت
+### خصوصية الشيت
 لا تجعل الملف «كل من لديه الرابط» — البوت يكفيه بريد حساب الخدمة.
 وللمشاركة مع طرف خارجي استعمل ملفاً وسيطاً بدالة `IMPORTRANGE` على النطاق المسموح فقط.
 
@@ -145,6 +145,14 @@ node test/run-tests.js
 - سعر الصرف يُكتب **رقماً ثابتاً** في الصف لحظة التسجيل — أبداً ليس معادلة.
 - الرسالة الواضحة تُسجَّل فوراً + إيصال بزر تراجع. البوت يسأل فقط عند الالتباس.
 - التراجع لا يحذف — يعلّم `ملغى` عبر معرّف الرسالة (كل صفوف العملية معاً).
+
+## Status
+
+Complete and operational. The deterministic Arabic parser is covered by a local test suite
+(`node test/run-tests.js`), the 55-node n8n workflow is generated and graph-validated by
+`build-workflow.js`, and the system has been hardened through production use (at-source update
+confirmation, per-node retries, idempotent writes, and full undo). It runs on a laptop via
+polling at zero hosting cost, with an optional Docker/VPS deployment path.
 
 ## License
 
